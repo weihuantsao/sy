@@ -808,7 +808,7 @@ ui = mountFigure({
     if (q.has('t')){ st.trig = q.get('how') || 'link'; st.t = +q.get('t'); if (st.trig === 'link'){ st.melted = true; st.meltT = 1; st.heat = 1; } else st.pull = 1; }
   },
 });
-{ const big = document.createElement('style'); big.textContent = 'header,.stage,#fig,.controls,.made-with{max-width:988px} header h1{font-size:28px;font-weight:800;letter-spacing:.04em}'; document.head.appendChild(big); }   // 30% larger than the default 760px
+{ const big = document.createElement('style'); big.textContent = 'header,.stage,#fig,.controls,.made-with{max-width:988px} header h1{font-size:28px;font-weight:800;letter-spacing:.04em} :root{--paper:#ffffff} body{background:#ffffff;background-image:none}'; document.head.appendChild(big); }   // 30% larger than the default 760px
 OX -= 150 * INK_K * INK_REF_VB / 988;   // slide the drawing left: the right column holds the FL-360 and N-2HP callouts
 document.querySelector('header h1').textContent = '廚房滅火系統 作動流程';   // title only, no 'Fig. 02 —'
 document.getElementById('wob').setAttribute('scale', '0');
