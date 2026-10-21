@@ -1,0 +1,922 @@
+<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body>
+<script>
+/* ============================================================
+   Colorfigures core: projection, shapes, shading, ink, labels, page shell.
+   A figure page includes this file (scripts/build.py inlines it), then calls mountFigure({...}).
+   See SKILL.md for the drawing contract and conventions.
+   One fixed view (front-left-top) and one fixed light (from above, behind the viewer's right shoulder: the front is lit,
+   the left side is in shade, and cast shadows fall toward the lower left of the screen).
+   ============================================================ */
+
+/* ---------- palettes ---------- */
+const PALS = {
+  mustard: { l:'#f4b829', m:'#d49c1f', d:'#4e4a18' },
+  tomato:  { l:'#ef6a4c', m:'#cf5038', d:'#4a2219' },
+  mint:    { l:'#93d3b0', m:'#71b693', d:'#1f4034' },
+  cobalt:  { l:'#76a0e2', m:'#5a82c6', d:'#1c2948' },
+  blush:   { l:'#f3a6bb', m:'#d8869c', d:'#4b2430' },
+};
+const METAL   = { l:'#eef0f0', m:'#c6ccce', d:'#8f989b' };
+const CLEAR   = { l:'#e4f2f4', m:'#c4dfe4', d:'#97b9c0' };
+const CERAMIC = { l:'#fbfaf3', m:'#e3e0d2', d:'#bdb8a6' };
+const DARK    = { l:'#55504a', m:'#3d3935', d:'#272421' };
+const INK = '#231e16';
+const SHADOW = '#41538f';
+
+/* ---------- projection (x = depth toward viewer-right, y = toward viewer-left, z = up) ---------- */
+const C = Math.cos(Math.PI/6), S = Math.sin(Math.PI/6);
+let OX = 0, OY = 0;
+/* VIEW turns the object in 90° steps about a vertical axis through its centre (RC):
+   0 = front (+x) and left (+y) faces toward the viewer, 1 = turned once (the +y side becomes the front)…
+   Figures keep modelling in their own coordinates; P / Dv / vis / tone / depthOf all apply the turn. */
+let VIEW = 0, RC = [0, 0];
+const VIEW_NAMES = ['front', 'left side', 'back', 'right side'];
+const TURNS = [0, 2];                 // the views the UI offers: front and back (figures still draw correctly in all four)
+const rotV = ([x,y,z]) => { switch (VIEW & 3){ case 1: return [y,-x,z]; case 2: return [-x,-y,z]; case 3: return [-y,x,z]; default: return [x,y,z]; } };
+const rotXY = (x,y) => { const r = rotV([x-RC[0], y-RC[1], 0]); return [r[0]+RC[0], r[1]+RC[1]]; };
+const P0 = (x,y,z) => [(x-y)*C + OX, (x+y)*S - z + OY];                       // raw iso, no turn
+const P  = (x,y,z) => { const [a,b] = rotXY(x,y); return [(a-b)*C + OX, (a+b)*S - z + OY]; };
+const Dv = (x,y,z) => { const [a,b,c] = rotV([x,y,z]); return [(a-b)*C, (a+b)*S - c]; };
+// distance toward the viewer in the current view: draw parts with smaller depth first
+const depthOf = p => { const [a,b] = rotXY(p[0],p[1]); return a + b + p[2]; };
+// sort [{at:[x,y,z], svg}] back-to-front for the current view and join
+const byDepth = parts => parts.filter(Boolean).sort((p,q) => depthOf(p.at) - depthOf(q.at)).map(p => p.svg).join('');
+const f  = v => v.toFixed(1);
+const pd = (pts, close=true) => 'M' + pts.map(p => { const q = P(p[0],p[1],p[2]); return f(q[0])+' '+f(q[1]); }).join('L') + (close ? 'Z' : '');
+const sp = pts => 'M' + pts.map(q => f(q[0])+' '+f(q[1])).join('L') + 'Z';
+
+/* ---------- 2D shapes in a plane's (u,v) coords (v up), mapped to 3D by a plane ---------- */
+const arcUV  = (cu,cv,r,a0,a1,n=7) => { const o=[]; for (let i=0;i<=n;i++){ const a=(a0+(a1-a0)*i/n)*Math.PI/180; o.push([cu+r*Math.cos(a), cv+r*Math.sin(a)]); } return o; };
+const rrUV   = (u0,v0,u1,v1,r,n=7) => r <= 0 ? rectUV(u0,v0,u1,v1) : [...arcUV(u1-r,v0+r,r,-90,0,n), ...arcUV(u1-r,v1-r,r,0,90,n), ...arcUV(u0+r,v1-r,r,90,180,n), ...arcUV(u0+r,v0+r,r,180,270,n)];
+const rectUV = (u0,v0,u1,v1) => [[u0,v0],[u1,v0],[u1,v1],[u0,v1]];
+const ellUV  = (cu,cv,ru,rv,n=24) => Array.from({length:n}, (_,i) => { const a=i/n*2*Math.PI; return [cu+ru*Math.cos(a), cv+rv*Math.sin(a)]; });
+const PX = x => ([u,v]) => [x,u,v];      // front-facing plane x = const   (u = y, v = z)
+const PY = y => ([u,v]) => [u,y,v];      // side plane y = const           (u = x, v = z)
+const PZ = z => ([u,v]) => [u,v,z];      // horizontal plane z = const     (u = x, v = y)
+const on = (plane, uv) => uv.map(plane);
+
+/* ---------- vectors + shading ---------- */
+const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]], dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const norm=a=>{ const l=Math.hypot(...a)||1; return a.map(v=>v/l); };
+const avg=ps=>ps.reduce((s,p)=>[s[0]+p[0]/ps.length,s[1]+p[1]/ps.length,s[2]+p[2]/ps.length],[0,0,0]);
+const vis = n => { const r = rotV(n); return r[0]+r[1]+r[2] > 1e-6; };   // viewer looks from (+1,+1,+1) after the turn
+const facing = vis;                                                       // readable alias: is this face toward the viewer?
+const SHADOW_K = 0.85, AZ_MIN = 20, AZ_MAX = 160;
+// cast shadows are drawn shorter than the shading light implies (0.45 × height instead of 0.85 ×): long shadows of tall
+// parts on thin supports (a lamp shade, a fan head) land far from the object and read as separate blobs
+const SHADOW_LEN = 0.45;
+let L = [0,0,1], SH = [0,0];
+function setLight(deg){ const a=deg*Math.PI/180; SH=[SHADOW_K*Math.cos(a), SHADOW_K*Math.sin(a)]; L=norm([-SH[0],-SH[1],1]); }
+const LIN = norm([.6,.2,1]);                       // fixed light for interiors / small props
+const tone  = (n,m) => { const d=dot(rotV(n),L);   return d>-.15 ? m.l : d>-.45 ? m.m : m.d; };   // exterior, follows the sun
+const toneI = (n,m) => { const d=dot(rotV(n),LIN); return d>.6 ? m.l : d>.05 ? m.m : m.d; };      // interior / props
+const mix = (a,b,t) => '#' + [1,3,5].map(i => Math.round(parseInt(a.substr(i,2),16)*(1-t) + parseInt(b.substr(i,2),16)*t).toString(16).padStart(2,'0')).join('');
+const matOf = hex => ({ l:hex, m:mix(hex,'#000000',.16), d:mix(hex,'#000000',.42) });
+const ease = t => t<.5 ? 2*t*t : 1-Math.pow(-2*t+2,2)/2;
+
+/* ---------- drawing primitives (all return SVG strings) ---------- */
+const ink   = (d,w=1.0) => `<path d="${d}" fill="none" stroke="${INK}" stroke-width="${w}" stroke-linejoin="round" stroke-linecap="round"/>`;
+const fill  = (d,c,extra='') => `<path d="${d}" fill="${c}" ${extra}/>`;
+const face  = (d,c) => `<path d="${d}" fill="${c}" stroke="${c}" stroke-width=".7" stroke-linejoin="round"/>`;
+const shape = (pts,c,w=.9) => fill(pd(pts),c) + (w ? ink(pd(pts),w) : '');
+const line  = (pts,w=.9) => ink(pd(pts,false),w);
+// Loft between two rings of equal length (closed). colour(n) picks each strip's fill; flip = seen from inside.
+function loft(A, B, colour, flip=false){
+  const n=A.length, cen=avg(A.concat(B)); let s='';
+  for (let i=0;i<n;i++){
+    const a0=A[i], a1=A[(i+1)%n], b1=B[(i+1)%n], b0=B[i];
+    let nr = norm(cross(sub(a1,a0), sub(b0,a0)));
+    if (!isFinite(nr[0])) continue;
+    if (dot(nr, sub(avg([a0,a1,b1,b0]), cen)) < 0) nr = nr.map(v=>-v);
+    if (flip) nr = nr.map(v=>-v);
+    if (vis(nr)) s += face(pd([a0,a1,b1,b0]), colour(nr));
+  }
+  return s;
+}
+function hull(pts){
+  pts = pts.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
+  const cr=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]); const lo=[], up=[];
+  for (const p of pts){ while(lo.length>=2 && cr(lo[lo.length-2],lo[lo.length-1],p)<=0) lo.pop(); lo.push(p); }
+  for (const p of pts.reverse()){ while(up.length>=2 && cr(up[up.length-2],up[up.length-1],p)<=0) up.pop(); up.push(p); }
+  lo.pop(); up.pop(); return lo.concat(up);
+}
+// Silhouette ink, weighted by how thick the part is on screen (like a hand inker): the w you pass is the most it gets.
+// Thickness = 2 × area / perimeter of the outline (a rod's diameter, about half a box's width), as a share of the
+// frame width. A long thin rod, a handle or a knob stays light (~1–1.5); a grinder, kettle or machine body gets the
+// heavy ~2.4–2.8. Thin parts stay thin and parts keep air between them.
+const hullInk = (pts3, w=1.4) => { const h = hull(pts3.map(p=>P(...p))); let a = 0, per = 0;
+  for (let i = 0; i < h.length; i++){ const p = h[i], q = h[(i+1) % h.length]; a += p[0]*q[1] - q[0]*p[1]; per += Math.hypot(q[0]-p[0], q[1]-p[1]); }
+  const thick = per ? Math.abs(a) / per / (INK_K * INK_REF_VB) : 0;
+  return ink(sp(h), Math.min(w, .9 + 20*thick)); };
+// Axis-aligned box: three visible faces, shaded, each outlined. shade = tone (sunlit) or toneI (interior).
+function box(x0,y0,z0,x1,y1,z1,m,shade=toneI,w=.9){
+  // all six faces, drawn only when they face the viewer (sides first, then top) — correct in every VIEW
+  const F = [
+    [[0,1,0],  [[x0,y1,z0],[x1,y1,z0],[x1,y1,z1],[x0,y1,z1]]],
+    [[1,0,0],  [[x1,y0,z0],[x1,y1,z0],[x1,y1,z1],[x1,y0,z1]]],
+    [[0,-1,0], [[x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1]]],
+    [[-1,0,0], [[x0,y0,z0],[x0,y1,z0],[x0,y1,z1],[x0,y0,z1]]],
+    [[0,0,1],  [[x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1]]] ];
+  return F.filter(([n]) => vis(n)).map(([n,q]) => shape(q, shade(n,m), w)).join('');
+}
+// Rounded-profile extrusion: profile (u=y, v=z) swept along x from x0 to x1. Body of most machines.
+function extrude(profileUV, x0, x1, m, shade=tone){ return loft(on(PX(x0),profileUV), on(PX(x1),profileUV), n=>shade(n,m)); }
+// Vertical cylinder (axis z) centred (x,y), radius r from z0 to z1, with top cap.
+function cyl(x,y,z0,z1,r,m,shade=toneI,w=1.2,n=24){
+  const A=on(PZ(z0),ellUV(x,y,r,r,n)), B=on(PZ(z1),ellUV(x,y,r,r,n));
+  return loft(A,B,nr=>shade(nr,m)) + fill(pd(B),shade([0,0,1],m)) + hullInk([...A,...B],w) + ink(pd(B),w*.8);
+}
+// Cylinder lying along x (e.g. a knob or dial sticking out of a front face): centred (y,z), from x0 to x1.
+function cylX(x0,x1,y,z,r,m,shade=toneI,w=1.1,n=20){
+  const A=on(PX(x0),ellUV(y,z,r,r,n)), B=on(PX(x1),ellUV(y,z,r,r,n));
+  // cap on whichever end faces the viewer (the +x end in VIEW 0)
+  const capB = vis([1,0,0]), cap = capB ? B : A, cn = capB ? [1,0,0] : [-1,0,0];
+  return loft(A,B,nr=>shade(nr,m)) + (vis(cn) ? fill(pd(cap),shade(cn,m)) : '') + hullInk([...A,...B],w) + (vis(cn) ? ink(pd(cap),w*.8) : '');
+}
+// Cylinder between any two 3D points a and b (a lamp arm, a rod, a pipe at an angle, a handle bar), radius r.
+// The end facing the viewer gets a cap. For a tapered part (a cone, a lamp shade) pass r1 for the radius at b.
+function rod(a, b, r, m, shade=toneI, w=1, r1=r, n=16){
+  const d = norm(sub(b, a)), u = norm(cross(d, Math.abs(d[2]) < .9 ? [0,0,1] : [1,0,0])), v = cross(d, u);
+  const ring = (p, rr) => Array.from({length:n}, (_,i) => { const t = i/n*2*Math.PI, c = Math.cos(t)*rr, s2 = Math.sin(t)*rr;
+    return [p[0] + u[0]*c + v[0]*s2, p[1] + u[1]*c + v[1]*s2, p[2] + u[2]*c + v[2]*s2]; });
+  const A = ring(a, r), B = ring(b, r1), capB = vis(d), cap = capB ? B : A, cn = capB ? d : d.map(x => -x);
+  return loft(A, B, nr => shade(nr, m)) + (Math.max(r, r1) > 0 ? fill(pd(cap), shade(cn, m)) + ink(pd(cap), w*.8) : '') + hullInk([...A, ...B], w);
+}
+// Text lying flat on a front plane x = const, centred at (y,z) baseline; reads left-to-right on screen.
+const txM = (o, U, V) => `matrix(${U[0].toFixed(4)} ${U[1].toFixed(4)} ${V[0].toFixed(4)} ${V[1].toFixed(4)} ${f(o[0])} ${f(o[1])})`;
+const tx = (x,y,z,str,size,col=INK,weight=700) => { const o=P(x,y,z);
+  return `<text transform="${txM(o, Dv(0,-1,0), Dv(0,0,-1))}" font-size="${size}" fill="${col}" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-weight="${weight}" letter-spacing=".04em">${str}</text>`; };
+// Text on a side plane y = const, centred at (x,z).
+const txY = (x,y,z,str,size,col=INK,weight=700) => { const o=P(x,y,z);
+  return `<text transform="${txM(o, Dv(1,0,0), Dv(0,0,-1))}" font-size="${size}" fill="${col}" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-weight="${weight}" letter-spacing=".04em">${str}</text>`; };
+// Cast shadow of a set of 3D points (any outline of the object), pushed along the light onto z = 0.
+// the light stays put relative to the viewer, so the shadow is cast in turned coordinates
+// z0: the surface it falls on (a board, a counter); clip it to that surface with clipTo(...) if it could spill off.
+// clip: the 3D outline of the surface it falls on (e.g. boardTop(...)), so it can't spill over the edge.
+const castShadow = (pts3, z0=0, clip=null) => { const k = SHADOW_LEN / SHADOW_K;
+  const s = fill(sp(hull(pts3.map(([x,y,z]) => { const [a,b] = rotXY(x,y); return P0(a+(z-z0)*SH[0]*k, b+(z-z0)*SH[1]*k, z0); }))), SHADOW);
+  return clip ? clipTo(clip, s) : s; };
+// A board for the object to stand on (a tray, a desk top, a counter): a rounded slab from (x0,y0) to (x1,y1), h thick.
+// Draw it first; then castShadow(points, h, boardTop(x0,y0,x1,y1,h,r)) so shadows lie on it and stop at its edge.
+const BOARD = { l:'#e6e1d4', m:'#cfc8b8', d:'#aaa293' }, WOOD = { l:'#d9a86c', m:'#bf8a4f', d:'#8e6236' };
+const boardTop = (x0,y0,x1,y1,h=3,r=5) => on(PZ(h), rrUV(x0,y0,x1,y1,r));
+function board(x0,y0,x1,y1,h=3,r=5,m=BOARD){
+  const A = on(PZ(0), rrUV(x0,y0,x1,y1,r)), B = boardTop(x0,y0,x1,y1,h,r);
+  return loft(A, B, n => toneI(n, m)) + fill(pd(B), m.l) + ink(pd(B), 1) + hullInk([...A, ...B], 1.8);
+}
+// Group helpers: clickable target, clip to an opening.
+const act  = (name, inner, data='') => `<g data-act="${name}" ${data}>${inner}</g>`;
+let _clipN = 0;
+// Part label (for "how does it work" figures): a cream pill with a leader line to a 3D point on the part.
+// dx, dy = where the pill sits, in screen units at the reference zoom (they scale with the figure like stroke widths).
+// on = that part is working right now (the pill turns the accent colour). Labels can be hidden with the Labels switch.
+function tag(p3, dx, dy, text, on=false){
+  const k = INK_K, [X,Y] = P(...p3), fs = 8.6*k, w = text.length*fs*.62 + fs*1.5, h = fs*1.8, cx = X + dx*k, cy = Y + dy*k;
+  return `<g class="tag${on ? ' on' : ''}"><path d="M${f(X)} ${f(Y)}L${f(cx)} ${f(cy)}" fill="none" stroke="${INK}" stroke-width="1"/>`
+    + `<circle cx="${f(X)}" cy="${f(Y)}" r="${f(1.3*k)}" fill="${INK}"/>`
+    + `<rect x="${f(cx-w/2)}" y="${f(cy-h/2)}" width="${f(w)}" height="${f(h)}" rx="${f(h/2)}" fill="${on ? 'var(--accent,#f4b829)' : '#fff4d6'}" stroke="${INK}" stroke-width="1.2"/>`
+    + `<text x="${f(cx)}" y="${f(cy+fs*.36)}" font-size="${f(fs)}" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-weight="800" letter-spacing=".04em" fill="${INK}">${text}</text></g>`;
+}
+const clipTo = (pts3, inner) => { const id = 'k' + (++_clipN); return `<clipPath id="${id}"><path d="${pd(pts3)}"/></clipPath><g clip-path="url(#${id})">${inner}</g>`; };
+
+/* ---------- constant on-screen line weight ----------
+   Stroke widths are written in model units, and each figure is zoomed to fill the frame, so a small
+   object would get fat lines. INK_K rescales every stroke-width (and the wobble/grain filter) so all
+   figures match the reference zoom of the booth / vending machine (viewBox ≈ 585 units wide). */
+const INK_REF_VB = 585;
+let INK_K = 1;
+const inkScale = svg => INK_K === 1 ? svg : svg.replace(/stroke-width="([\d.]+)"/g, (_, w) => `stroke-width="${(+w * INK_K).toFixed(2)}"`);
+
+/* ---------- page shell ---------- */
+const CORE_CSS = `
+  :root{--paper:#f2efe7;--ink:#231e16;--muted:#857d6e;--rule:#ddd6c8}
+  *{box-sizing:border-box} html,body{margin:0;height:100%}
+  body{background-color:var(--paper);
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='320' height='320'><filter id='p'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 .42  0 0 0 0 .39  0 0 0 0 .33  .16 0 0 0 0'/></filter><rect width='100%' height='100%' filter='url(%23p)'/></svg>");
+    overflow-x:hidden;color:var(--ink);font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;display:flex;flex-direction:column;align-items:center;padding:24px 16px 32px}
+  header{width:100%;max-width:760px;display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
+  header h1{font-size:13px;font-weight:600;margin:0;letter-spacing:.02em} header span{color:var(--muted)}
+  #fig{width:100%;max-width:760px;height:auto;display:block;margin:4px 0 8px;user-select:none;overflow:visible}
+  #fig [data-act]{cursor:pointer}
+  #readout, .idea{display:none}   /* status line + big idea are off: the buttons and motion tell the story */
+  .idea{width:100%;max-width:760px;margin:-6px 0 16px;font-size:12.5px;line-height:1.5;text-align:center;color:var(--ink)}
+  .idea strong{letter-spacing:.12em;text-transform:uppercase;font-size:11px;margin-right:8px}
+  #readout{position:relative;min-height:1.4em;letter-spacing:.08em;text-transform:uppercase;margin-bottom:14px;text-align:center;text-shadow:0 0 3px var(--paper),0 0 6px var(--paper),0 0 10px var(--paper)}
+  .stage{position:relative;width:100%;max-width:760px}
+  .actions{position:absolute;top:4px;left:0;display:flex;flex-direction:column;align-items:flex-start;gap:8px;z-index:2;max-width:220px}
+  .actions .cap{color:var(--muted);font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin:0 0 2px}
+  html.nolabels #fig .tag{display:none}
+  .ctl[hidden]{display:none}
+  /* ui.flash(text): a short note under the buttons ("the can is empty — refill it"); the status line itself stays hidden */
+  .toast{position:absolute;left:0;z-index:3;font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;background:var(--paper);
+    border:1.5px solid var(--ink);border-radius:8px;padding:4px 9px;box-shadow:2px 2px 0 var(--ink);opacity:0;transition:opacity .2s;pointer-events:none;max-width:240px}
+  .toast.show{opacity:1}
+  .made-with{width:100%;max-width:760px;margin-top:18px;text-align:right;font-size:11px;letter-spacing:.1em;text-transform:uppercase}
+  .made-with a{color:var(--muted);text-decoration:none} .made-with a:hover{color:var(--ink)}
+  .stats{position:absolute;top:4px;right:0;display:flex;flex-direction:column;align-items:flex-end;gap:10px;z-index:2;text-align:right}
+  .stat .k{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+  .stat .v{font-size:34px;font-weight:800;line-height:1.05;letter-spacing:-.01em;font-variant-numeric:tabular-nums;color:var(--ink)}
+  .stat.small .v{font-size:20px}
+  .stat .v.bump{animation:bump .35s ease-out}
+  @keyframes bump{0%{transform:scale(1.18)}100%{transform:none}}
+  .stepwrap{position:relative;display:flex;align-items:center;gap:8px}
+  .act{font:inherit;color:var(--ink);background:var(--paper);border:1.5px solid var(--ink);border-radius:999px;padding:5px 14px;cursor:pointer;white-space:nowrap}
+  .act:hover{background:color-mix(in srgb,var(--paper) 92%,var(--ink))}
+  .act .car{margin-left:6px;font-size:10px}
+  .act:focus-visible{outline:2px solid var(--ink);outline-offset:3px}
+  .chips{display:none;flex-wrap:wrap;gap:6px;background:var(--paper);border:2px solid var(--ink);border-radius:12px;box-shadow:3px 3px 0 var(--ink);
+    padding:8px;width:max-content;max-width:min(300px,62vw);position:absolute;left:calc(100% + 10px);top:-4px;z-index:3}
+  .stepwrap.open .chips{display:flex}
+  .chip{white-space:nowrap;font:inherit;font-size:11.5px;font-weight:700;color:var(--ink);background:var(--paper);border:1.5px solid var(--ink);border-radius:8px;padding:4px 8px;cursor:pointer;box-shadow:2px 2px 0 var(--ink)}
+  .chip:hover{background:var(--accent,#f4b829);transform:translate(-1px,-1px)}
+  .chip.current{background:var(--ink);color:var(--paper)} .chip.current:hover{background:var(--ink);transform:none}
+  .chip.off{opacity:.45} .chip.off:hover{transform:none;background:var(--paper)}
+  
+  @media (max-width:560px){body{padding:14px 12px 24px}header span,.actions .cap{display:none}.actions{flex-direction:row;flex-wrap:wrap;gap:6px}.act{font-size:12px;padding:4px 11px}.stats{position:static;flex-direction:row;justify-content:flex-end;gap:18px;margin-bottom:4px}.actions{position:static;max-width:none;margin:6px 0 4px}.chips{left:0;top:calc(100% + 8px)}}
+  .controls{width:100%;max-width:760px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px 28px;border-top:1px solid var(--rule);padding-top:16px}
+  .ctl{display:flex;flex-direction:column;gap:6px}
+  .ctl label{color:var(--muted);font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+  input[type=range]{width:100%;accent-color:var(--ink)}
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  button{font:inherit;color:var(--ink);background:transparent;border:1.5px solid var(--ink);border-radius:999px;padding:5px 14px;cursor:pointer}
+  button:hover{background:#0000000d}
+  .sw{width:26px;height:26px;padding:0;border-radius:50%} .sw[aria-pressed=true]{outline:2px solid var(--ink);outline-offset:2px}`;
+
+const filterFor = k => `<filter id="hand" x="-3%" y="-3%" width="106%" height="106%" color-interpolation-filters="sRGB">
+  <feTurbulence type="fractalNoise" baseFrequency="${(0.045/k).toFixed(4)}" numOctaves="2" seed="4" result="warp"/>
+  <feDisplacementMap id="wob" in="SourceGraphic" in2="warp" scale="${(2.4*k).toFixed(2)}" xChannelSelector="R" yChannelSelector="G" result="wob"/>
+  <feTurbulence type="fractalNoise" baseFrequency="${(0.9/k).toFixed(4)}" numOctaves="3" seed="11" result="n1"/>
+  <feColorMatrix in="n1" type="matrix" values=".3 0 0 0 .84  .3 0 0 0 .84  .3 0 0 0 .84  0 0 0 0 1" result="grain"/>
+  <feTurbulence type="fractalNoise" baseFrequency="${(0.012/k).toFixed(4)}" numOctaves="2" seed="7" result="n2"/>
+  <feColorMatrix in="n2" type="matrix" values=".3 0 0 0 .85  .3 0 0 0 .85  .3 0 0 0 .85  0 0 0 0 1" result="blot"/>
+  <feBlend in="wob" in2="grain" mode="multiply" result="g1"/><feBlend in="g1" in2="blot" mode="multiply" result="g2"/>
+  <feComposite in="g2" in2="wob" operator="in"/></filter>`;
+
+/* mountFigure({
+     fig:'03', title:'Photo booth', hint:'click the curtain…',
+     size:[W,D,H],                 // bounding box, used to frame the view (shadow range included)
+     palette:'mustard',            // default PALS key
+     state:{...},                  // figure state (st.pal is built in)
+     scene: (st, m) => svgString,  // m = current palette {l,m,d}
+     readout: st => 'text',        // status line under the figure
+     buttons: [{label, onClick(st, ui)}      // listed in the order the user should do them
+               | {label, choices: st => [{label, onClick(st,ui), current?, disabled?, why?}]}],   // opens a picker
+     stats: st => [{label, value, small?}],   // optional: big numbers top-right (credit, change, score)
+     credit: false,                // optional: hide the small "Made with Colorfigures" link
+     acts: { name(st, el, ui){} },  // clicks on act(name, …) groups; el has dataset
+     params(st, q){}               // optional: read URLSearchParams for screenshot states
+   })  -> ui = { st, render, animate(stepFn), flash(text,ms) }
+   animate(step): calls step(dt seconds) every frame and re-renders until step returns false. */
+addEventListener('error', e => { document.documentElement.dataset.errors = (document.documentElement.dataset.errors || '') + ' ' + e.message + ';'; });
+function mountFigure(cfg){
+  document.title = cfg.title;
+  const style = document.createElement('style'); style.textContent = CORE_CSS; document.head.appendChild(style);
+  document.body.innerHTML = `
+    <header><h1>Fig. ${cfg.fig} — ${cfg.title}</h1><span>${cfg.hint || ''}</span></header>
+    <div class="stage">
+      ${cfg.buttons && cfg.buttons.length ? `<div class="actions" id="btns"><div class="cap">${cfg.buttonsLabel || 'Try it'}</div></div>` : ''}
+      ${cfg.stats ? '<div class="stats" id="stats"></div>' : ''}
+      <div class="toast" id="toast" role="status"></div>
+      <svg id="fig" role="img" aria-label="${cfg.title}"><defs id="fdefs"></defs><g id="art" filter="url(#hand)"></g></svg>
+    </div>
+    <div id="readout"></div>
+    ${cfg.idea ? `<p class="idea"><strong>The big idea</strong>${cfg.idea}</p>` : ''}
+    <div class="controls">
+      <div class="ctl"><label for="wb">Hand-drawn wobble</label><input id="wb" type="range" min="0" max="7" step="0.1" value="2.4"></div>
+      <div class="ctl"><label>Colour</label><div class="row" id="pals"></div></div>
+      <div class="ctl" id="lblctl" hidden><label>Labels</label><div class="row"><button id="lbl" aria-pressed="true">On</button></div></div>
+    </div>
+    ${cfg.credit === false ? '' : '<footer class="made-with"><a href="https://april-zhu.com/colorfigures" target="_blank" rel="noopener">Made with Colorfigures ↗</a></footer>'}`;
+  const st = cfg.state || {};            // kept as the same object, so a figure may hold on to it
+  if (!st.pal) st.pal = cfg.palette || 'mustard';
+  if (st.az == null) st.az = 105;
+  const q = new URLSearchParams(location.search);
+  if (PALS[q.get('pal')]) st.pal = q.get('pal');
+  if (cfg.params) cfg.params(st, q);
+
+  // frame on the object itself: centred, filling ~60% of the width / ~78% of the height of a 4:3 view.
+  // The cast shadow is allowed to spill outside the frame (svg overflow is visible).
+  const [W,D,H] = cfg.size, pts = [];
+  OX = OY = 0; RC = cfg.center || [W/2, D/2];
+  VIEW = 0;
+  for (const x of [0,W]) for (const y of [0,D]) for (const z of [0,H]) pts.push(P(x,y,z));
+  const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]);
+  const bw = Math.max(...xs)-Math.min(...xs), bh = Math.max(...ys)-Math.min(...ys);
+  // the object fills ~74% of the width / ~88% of the height, nudged right of centre so the buttons (top left) stay clear
+  const vbW = Math.max(bw/.74, bh/.88/.75), vbH = vbW*.75;
+  OX = (vbW-bw)/2 + vbW*.06 - Math.min(...xs); OY = vbH*.04 - Math.min(...ys);   // sit a little high: shadows fall downward
+  const svg = document.getElementById('fig');
+  svg.setAttribute('viewBox', `0 0 ${f(vbW)} ${f(vbH)}`);
+  INK_K = vbW / INK_REF_VB;
+  document.getElementById('fdefs').innerHTML = filterFor(INK_K);
+
+  const art = document.getElementById('art'), readout = document.getElementById('readout');
+  const ui = { st };
+  ui.render = () => { _clipN = 0; document.documentElement.style.setProperty('--accent', PALS[st.pal].l); art.innerHTML = inkScale(cfg.scene(st, PALS[st.pal])); if (!ui._flash) readout.textContent = cfg.readout ? cfg.readout(st) : ''; if (ui.drawStats) ui.drawStats(); };
+  // big numbers in the top-right corner (credit, change, score…); a value that changes gets a little bump
+  const statsEl = document.getElementById('stats'), prevStats = {};
+  ui.drawStats = () => { if (!statsEl) return;
+    const list = cfg.stats(st).filter(Boolean), html = list.map(x => `<div class="stat${x.small ? ' small' : ''}"><div class="k">${x.label}</div><div class="v" data-k="${x.label}">${x.value}</div></div>`).join('');
+    if (statsEl._html !== html){ statsEl._html = html; statsEl.innerHTML = html;
+      statsEl.querySelectorAll('.v').forEach(v => { if (prevStats[v.dataset.k] != null && prevStats[v.dataset.k] !== v.textContent) v.classList.add('bump'); prevStats[v.dataset.k] = v.textContent; }); } };
+  let flashT = 0;
+  const toast = document.getElementById('toast');
+  ui.flash = (text, ms=1600) => { ui._flash = true; readout.textContent = text; toast.textContent = text;
+    toast.style.top = ((document.getElementById('btns') ? document.getElementById('btns').offsetTop + document.getElementById('btns').offsetHeight : 0) + 8) + 'px'; toast.classList.add('show');
+    clearTimeout(flashT); flashT = setTimeout(() => { ui._flash = false; toast.classList.remove('show'); ui.render(); }, ms); };
+  // animations run on a ~60 fps timer rather than requestAnimationFrame, so they also run in headless test shots
+  ui.animate = step => { let last = performance.now();
+    const loop = () => { const now = performance.now(), dt = Math.max(0, Math.min(.05,(now-last)/1000)); last = now; const more = step(dt) !== false; ui.render(); if (more) setTimeout(loop, 16); };
+    setTimeout(loop, 16); };
+
+  // clickable parts react on press, not on click: while something animates, the scene is redrawn every frame, so the
+  // element under the pointer is replaced between press and release and a 'click' would never fire
+  svg.addEventListener('pointerdown', e => { if (e.button) return; const a = e.target.closest('[data-act]'); if (!a || !cfg.acts || !cfg.acts[a.dataset.act]) return;
+    e.preventDefault(); cfg.acts[a.dataset.act](st, a, ui); ui.render(); });
+  const btns = document.getElementById('btns');
+  const stepEls = [];
+  if (btns) cfg.buttons.forEach((b, i) => {
+    const wrap = document.createElement('div'); wrap.className = 'stepwrap';
+    const el = document.createElement('button'); el.className = 'act';
+    el.innerHTML = `${b.label}${b.choices ? '<span class="car">▾</span>' : ''}`;
+    wrap.appendChild(el); btns.appendChild(wrap); stepEls.push(el);
+    if (!b.choices){ el.onclick = () => { closeChips(); b.onClick(st, ui); ui.render(); }; return; }
+    const chips = document.createElement('div'); chips.className = 'chips'; wrap.appendChild(chips);
+    el.onclick = e => { e.stopPropagation(); const open = !wrap.classList.contains('open'); closeChips();
+      if (!open) return;
+      chips.innerHTML = '';
+      // every choice stays clickable, so nothing silently ignores a press:
+      //   current:true  = the one in use (shown selected); a press just says so
+      //   disabled:true = not possible right now (shown faded); a press says why (c.why, or a generic note)
+      for (const c of b.choices(st)){ const ch = document.createElement('button'); ch.className = 'chip' + (c.current ? ' current' : c.disabled ? ' off' : ''); ch.textContent = c.label;
+        if (c.current) ch.setAttribute('aria-pressed', 'true');
+        ch.onclick = ev => { ev.stopPropagation(); closeChips();
+          if (c.current) return ui.flash(`${c.label} — already set`);
+          if (c.disabled) return ui.flash(c.why || `${c.label} isn't possible right now`);
+          c.onClick(st, ui); ui.render(); }; chips.appendChild(ch); }
+      wrap.classList.add('open'); };
+  });
+  function closeChips(){ document.querySelectorAll('.stepwrap.open').forEach(w => w.classList.remove('open')); }
+  document.addEventListener('click', closeChips);
+
+  document.getElementById('wb').oninput = e => document.getElementById('wob').setAttribute('scale', (e.target.value * INK_K).toFixed(2));
+  const pals = document.getElementById('pals');
+  for (const [k,p] of Object.entries(PALS)){
+    const b = document.createElement('button'); b.className='sw'; b.title=k; b.style.background=p.l; b.setAttribute('aria-pressed', k===st.pal);
+    b.onclick = () => { st.pal=k; [...pals.children].forEach(c=>c.setAttribute('aria-pressed', c===b)); ui.render(); };
+    pals.appendChild(b);
+  }
+  // labels: the switch appears when the figure draws any tag(); ?labels=0 starts with them hidden
+  const lblctl = document.getElementById('lblctl'), lbl = document.getElementById('lbl');
+  const setLabels = on => { document.documentElement.classList.toggle('nolabels', !on); lbl.textContent = on ? 'On' : 'Off'; lbl.setAttribute('aria-pressed', on); };
+  lbl.onclick = () => setLabels(document.documentElement.classList.contains('nolabels'));
+  if (q.get('labels') === '0') setLabels(false);
+  // testing: ?press=Label@ms,Label@ms clicks the buttons whose text starts with Label at those times after load
+  // (any order, repeats allowed); Label>Choice picks a choice from a picker button (?press=Speed>3@300).
+  // Script errors and unknown labels are recorded on <html data-errors="…">
+  window.__st = st;
+  const noteErr = m => { document.documentElement.dataset.errors = (document.documentElement.dataset.errors || '') + ' ' + m + ';'; };
+  const starts = (el, t) => el.textContent.trim().toLowerCase().startsWith(t.trim().toLowerCase());
+  if (q.has('press')) q.get('press').split(',').forEach(item => { const [what, ms] = item.split('@'), [label, choice] = what.split('>');
+    setTimeout(() => { const b = [...document.querySelectorAll('.act')].find(b => starts(b, label));
+      if (!b) return noteErr(`no button "${label}"`);
+      b.click(); if (choice == null) return;
+      const c = [...b.parentElement.querySelectorAll('.chip')].find(c => starts(c, choice));
+      if (c && !c.disabled) c.click(); else noteErr(`no choice "${choice}" in "${label}"`); }, +ms || 0); });
+  setLight(st.az); ui.render();
+  if (art.querySelector('.tag')) lblctl.hidden = false;
+  return ui;
+}
+
+</script>
+<script>
+/* Extinguisher inspection and refill workshop: one extinguisher goes through the seven steps, station by station.
+   x = out from the back row, y = along the row (+y = viewer-left, where the work starts), z = up. 示意, compressed. */
+const FH = 3;
+const BRD = [0, 0, 150, 404];
+const UP = [0, 0, 1], DOWN = [0, 0, -1];
+const BODY = 28, SHOULDER = 4, NECK = 2;                       // extinguisher: body, shoulder, neck lengths along its axis
+const TOP = BODY + SHOULDER + NECK;
+const KG = 3.5;
+const SPOT = {
+  wash:    { base:[35, 381, 9],   ax:UP },
+  vent:    { base:[80, 330, FH],  ax:UP },
+  extract: { base:[30, 326, 82 + TOP], ax:DOWN },
+  bench:   { base:[36, 266, 62],  ax:UP },
+  hydro:   { base:[30, 220, 10],  ax:UP },
+  dryer:   { base:[30, 178, 40 + TOP], ax:DOWN },
+  scale:   { base:[34, 131, 15],  ax:UP },
+  guard:   { base:[36, 92, 32],   ax:[0, -1, 0] },
+  tank:    { base:[96, 96, 15],   ax:[0, -1, 0] },
+  done:    { base:[74, 26, FH],   ax:UP },
+};
+const TRAY = [46, 252, 63];                                     // where the valve waits while the bottle is serviced
+
+const RED = { l:'#ef6a4c', m:'#cf5038', d:'#4a2219' };
+const STEEL = { l:'#eef1f2', m:'#c9cfd2', d:'#949da1' };
+const FLOOR = { l:'#e2e5e6', m:'#ccd1d3', d:'#a4abaf' };
+const BLUEP = { l:'#4d8fd6', m:'#336fb3', d:'#1d4473' };
+const BRASS = { l:'#f0cf6e', m:'#cfa94a', d:'#8d6f25' };
+const WATER = '#3d9be0';
+
+/* ---------- helpers ---------- */
+function lerp3(a, b, t){ return a.map((v, i) => v + (b[i] - v) * t); }
+function add3(a, b, k = 1){ return a.map((v, i) => v + b[i] * k); }
+const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+const seg = (p, a, b) => clamp((p - a) / (b - a));
+// move between two spots: lift on the way, turn the axis smoothly (through +x when flipping over)
+function travel(A, B, t){
+  const e = ease(t), base = add3(lerp3(A.base, B.base, e), [0, 0, 34 * Math.sin(Math.PI * e)]);
+  const flip = dot(A.ax, B.ax) < .5 ? .9 : 0;            // only swing through +x when the bottle actually turns over
+  const ax = norm(add3(lerp3(A.ax, B.ax, e), [1, 0, 0], flip * Math.sin(Math.PI * e)));
+  return { base, ax, where:'travel' };
+}
+const sideOf = ax => norm(cross(ax, Math.abs(ax[2]) > .9 ? [0, 1, 0] : [0, 0, 1]));
+
+/* ---------- the extinguisher ---------- */
+function valveDraw(pos, ax, pressure, lever = true){
+  const sd = sideOf(ax), fw = norm(cross(sd, ax));
+  let s = rod(pos, add3(pos, ax, 6), 3.3, { l:'#5a5550', m:'#3d3935', d:'#272421' }, toneI, 1);
+  const g = add3(add3(pos, ax, 3.4), fw, 3.6);
+  s += rod(add3(pos, ax, 3.4), g, 2.4, METAL, toneI, .8);
+  const face = Array.from({ length:16 }, (_, i) => { const a = i / 16 * 2 * Math.PI; return add3(add3(g, sd, 2.3 * Math.cos(a)), ax, 2.3 * Math.sin(a)); });
+  s += shape(face, '#fbf8ee', .7);
+  const na = Math.PI * (.85 - .7 * pressure);   // needle: left = empty, right = full
+  s += line([g, add3(add3(g, sd, -1.9 * Math.cos(na)), ax, 1.9 * Math.sin(na))], .9);
+  if (lever) s += rod(add3(pos, ax, 6), add3(add3(pos, ax, 7.5), sd, -13), .9, METAL, toneI, .9) + rod(add3(pos, ax, 4.5), add3(add3(pos, ax, 5.5), sd, -12), .9, METAL, toneI, .9);
+  return s;
+}
+function extinguisher(o){
+  const { base, ax } = o, sd = sideOf(ax), fw = norm(cross(sd, ax));
+  const top = add3(base, ax, BODY), sh = add3(base, ax, BODY + SHOULDER), nk = add3(base, ax, TOP);
+  let s = rod(base, top, 6.5, RED, tone, 1.4);
+  s += rod(top, sh, 6.5, RED, tone, 1.1, 3);
+  s += rod(sh, nk, 2.8, BRASS, toneI, .9);
+  // label band
+  const lb = add3(base, ax, BODY * .5);
+  s += rod(add3(lb, ax, -4.5), add3(lb, ax, 4.5), 6.62, { l:'#fbf6e6', m:'#e9e3d0', d:'#c8c0a8' }, tone, .8);
+  // dirt and chipped paint on the side facing us
+  const spot = (u, v, r, col, op) => { const c = add3(add3(base, ax, u), fw, 0); const pts = Array.from({ length:12 }, (_, i) => { const a = i / 12 * 2 * Math.PI;
+      return add3(add3(add3(c, norm(add3(fw, sd, v)), 6.6), ax, r * Math.sin(a)), sd, r * .9 * Math.cos(a)); }); return fill(pd(pts), col, `opacity="${f(op)}"`); };
+  if (o.dirt > 0) for (const [u, v, r] of [[5, -.5, 2.4], [9, .4, 1.8], [22, -.2, 2], [25, .6, 1.4]]) s += spot(u, v, r, '#7a5a3a', .85 * o.dirt);
+  if (o.chips > 0) for (const [u, v, r] of [[17, .5, 1.6], [3, .2, 1.2]]) s += spot(u, v, r, '#9aa3a6', o.chips);
+  // inspection ring on the neck
+  if (o.ring) s += rod(add3(sh, ax, .2), add3(sh, ax, 1.4), 3.6, o.ring === 'new' ? { l:'#ffe066', m:'#f2c230', d:'#a7820f' } : { l:'#c9c3b0', m:'#a8a18c', d:'#7d7765' }, toneI, .8);
+  if (o.valve) s += valveDraw(nk, ax, o.pressure);
+  // finished: a yellow service tag hangs from the neck
+  if (o.tag > 0){ const t0 = add3(nk, sd, 3), t1 = add3(add3(t0, sd, 6), ax, -10 * o.tag);
+    s += line([t0, t1], .8) + shape([add3(t1, sd, -3), add3(t1, sd, 4), add3(add3(t1, sd, 4), ax, -9), add3(add3(t1, sd, -3), ax, -9)], '#ffe066', 1); }
+  return s;
+}
+
+/* ---------- stations ---------- */
+const plate = (x, y, z, str, size = 4) => tx(x + .15, y, z, str, size, INK, 800);
+function washBay(){
+  let s = box(10, 362, FH, 62, 400, 9, STEEL, toneI, 1.1);
+  s += fill(pd([[13, 365, 9.05], [59, 365, 9.05], [59, 397, 9.05], [13, 397, 9.05]]), '#9fc9e8');
+  s += cyl(56, 404 - 8, FH, 14, 4, BLUEP, toneI, 1, 16);                                       // paint tin
+  s += plate(62, 381, 4, '清洗補漆', 3.6);
+  return s;
+}
+function extractor(st, o){
+  let s = '';
+  for (const [x, y] of [[12, 307], [48, 307], [12, 345], [48, 345]]) s += rod([x, y, FH], [x, y, 32], 1.4, STEEL, toneI, .8);
+  s += loft(on(PZ(20), ellUV(30, 326, 4, 4, 18)), on(PZ(36), ellUV(30, 326, 16, 16, 18)), n => toneI(n, STEEL));   // cone bin
+  s += box(10, 306, 36, 50, 346, 80, STEEL, toneI, 1.2);
+  s += shape(on(PX(50.1), rectUV(312, 46, 340, 70)), '#cfe9f0', 1);                           // window
+  if (o.powderOut) for (let i = 0; i < 10; i++){ const u = (st.clock * 1.4 + i / 10) % 1; const [X, Y] = P(50.2, 318 + (i * 7) % 20, 70 - 22 * u);
+    s += `<circle cx="${f(X)}" cy="${f(Y)}" r="1.4" fill="#f4f1ea" stroke="#b9b2a2" stroke-width=".5"/>`; }
+  s += cyl(30, 326, 80, 83, 7, METAL, toneI, 1, 18);                                          // inverted-bottle port
+  s += cyl(18, 352, 40, 96, 6, STEEL, toneI, 1, 18);                                          // cyclone
+  s += rod([18, 352, 96], [30, 336, 100], 2.4, BLUEP, toneI, 1) + rod([30, 336, 100], [30, 330, 84], 2.4, BLUEP, toneI, 1);
+  // control panel with the monitoring screen
+  s += box(10, 286, FH, 30, 304, 92, STEEL, toneI, 1.1);
+  s += shape(on(PX(30.1), rectUV(288, 66, 302, 86)), '#1d2a26', 1);
+  s += tx(30.2, 295, 79, '乾粉', 3, '#8af0ae', 700) + tx(30.2, 295, 71, o.kg.toFixed(1) + 'kg', 3.6, '#8af0ae', 800);
+  for (const [y, c] of [[290, '#43c25c'], [295, '#e2483d'], [300, '#f2c230']]) s += shape(on(PX(30.15), ellUV(y, 56, 1.6, 1.6, 10)), c, .6);
+  s += plate(50, 326, 40, '抽粉設備', 3.6);
+  return s;
+}
+function bench(st, o){
+  let s = '';
+  for (const [x, y] of [[12, 244], [56, 244], [12, 290], [56, 290]]) s += rod([x, y, FH], [x, y, 60], 1.3, STEEL, toneI, .8);
+  s += box(10, 242, 58, 58, 292, 62, STEEL, toneI, 1.1);
+  s += box(40, 246, 62, 54, 258, 64, BLUEP, toneI, .9);                                       // parts tray
+  // handheld endoscope screen, probe into the neck while inspecting
+  s += box(14, 274, 62, 22, 288, 76, { l:'#4a4744', m:'#2f2c29', d:'#1b1917' }, toneI, 1);
+  s += shape(on(PX(22.1), rectUV(276, 64.5, 286, 74)), o.scope ? '#20343d' : '#1d2a26', .8);
+  if (o.scope){ s += shape(on(PX(22.2), ellUV(281, 69.2, 3.4, 3.4, 18)), '#9ec7d6', .6) + tx(22.3, 281, 65.3, '無鏽蝕', 1.8, '#8af0ae', 800);
+    const nk = add3(o.base, o.ax, TOP + 2); s += `<path d="${pd([[22, 280, 70], [26, 276, 82], nk], false)}" fill="none" stroke="${INK}" stroke-width="1.6"/>`; }
+  if (o.clean) for (let i = 0; i < 3; i++){ const u = (st.clock * 2 + i / 3) % 1, [X, Y] = P(TRAY[0] + 4 - i * 3, TRAY[1] + 2, TRAY[2] + 6 + u * 6);
+    s += `<path d="M${f(X - 2)} ${f(Y)}L${f(X + 2)} ${f(Y)}M${f(X)} ${f(Y - 2)}L${f(X)} ${f(Y + 2)}" stroke="#3d9be0" stroke-width="1" opacity="${f(1 - u)}"/>`; }
+  s += plate(58, 266, 50, '內視鏡・零件', 3.2);
+  return s;
+}
+function hydroBack(){ return box(10, 202, FH, 50, 238, 60, STEEL, toneI, 1.2); }
+function hydroFront(st, o){
+  // front skin drawn again over the bottle sitting inside, plus gauges and the model plate
+  let s = shape([[50, 202, FH], [50, 238, FH], [50, 238, 60], [50, 202, 60]], toneI([1, 0, 0], STEEL), 1.2);
+  s += box(12, 204, 60, 48, 236, 62, STEEL, toneI, 1);
+  for (const [y, k] of [[212, 0], [228, 1]]){ s += cylX(44, 46, y, 72, 4.6, METAL, toneI, 1, 18) + rod([44, y, 62], [44, y, 67.4], 1, METAL, toneI, .8);
+    s += fill(pd(on(PX(46.1), ellUV(y, 72, 3.8, 3.8, 18))), '#fbf8ee');
+    const a = Math.PI * (.85 - .7 * o.hydroP); s += line([[46.2, y, 72], [46.2, y - 3 * Math.cos(a), 72 + 3 * Math.sin(a)]], .9); }
+  s += shape(on(PX(50.1), rectUV(206, 40, 234, 52)), '#fbf6e6', .9) + tx(50.2, 220, 47, '耐水壓設備', 3.2, INK, 800) + tx(50.2, 220, 42, 'GC-02T2', 2.6, '#6a6658', 800);
+  if (o.hydroOk) s += shape(on(PX(50.1), ellUV(220, 30, 3.4, 3.4, 16)), '#43c25c', .8);
+  return s;
+}
+function dryerBack(){
+  let s = box(10, 160, FH, 50, 196, 34, STEEL, toneI, 1.1);
+  s += box(10, 160, 34, 14, 196, 64, STEEL, toneI, 1);                                         // back panel
+  s += rod([30, 178, 34], [30, 178, 40], 2, METAL, toneI, .9);                                 // hot-air post
+  s += box(10, 172, 64, 16, 184, 78, STEEL, toneI, .9) + shape(on(PX(16.1), ellUV(178, 71, 2.6, 2.6, 14)), '#e2483d', .7);
+  return s;
+}
+function dryerFront(st, o){
+  let s = shape([[50, 160, FH], [50, 196, FH], [50, 196, 34], [50, 160, 34]], toneI([1, 0, 0], STEEL), 1.1);
+  s += shape(on(PX(50.1), rectUV(164, 14, 192, 26)), '#fbf6e6', .9) + tx(50.2, 178, 21, '烘乾設備', 3.2, INK, 800) + tx(50.2, 178, 16, 'GC-02D2', 2.6, '#6a6658', 800);
+  if (o.heat > 0) for (let i = 0; i < 3; i++){ const u = (st.clock * .8 + i / 3) % 1, pts = [];
+    for (let k = 0; k <= 8; k++){ const z = 36 + k * 4 + u * 10; pts.push([42, 168 + i * 10 + 1.6 * Math.sin(k * 1.4 + st.clock * 5), z]); }
+    s += `<path d="${pd(pts, false)}" fill="none" stroke="#f08a3c" stroke-width="1.3" opacity="${f(o.heat * (1 - u))}"/>`; }
+  return s;
+}
+function filler(st, o){
+  let s = '';
+  s += box(12, 112, FH, 56, 150, 12, STEEL, toneI, 1.1);                                       // scale platform
+  s += box(48, 140, 12, 56, 150, 22, { l:'#4a4744', m:'#2f2c29', d:'#1b1917' }, toneI, .9);
+  s += tx(56.1, 145, 15.6, o.scale.toFixed(2) + 'kg', 2.4, '#8af0ae', 800);
+  for (const [y] of [[114], [148]]) s += rod([14, y, FH], [14, y, 108], 1.6, STEEL, toneI, .9);
+  s += rod([14, 114, 104], [14, 148, 104], 1.6, STEEL, toneI, .9);
+  s += loft(on(PZ(70), ellUV(34, 131, 3, 3, 18)), on(PZ(96), ellUV(34, 131, 15, 15, 18)), n => toneI([n[0], n[1], 0], STEEL));   // hopper
+  s += fill(pd(on(PZ(96), ellUV(34, 131, 15, 15, 18))), '#f4f1ea') + ink(pd(on(PZ(96), ellUV(34, 131, 15, 15, 18))), 1.2);
+  s += rod([14, 131, 100], [34, 131, 100], 1.4, STEEL, toneI, .8);
+  if (o.pour){ const top = [34, 131, 70], bot = add3(o.base, o.ax, TOP + 1);
+    s += `<path d="${pd([top, bot], false)}" fill="none" stroke="#e9e3d0" stroke-width="3" stroke-dasharray="2 1.5" stroke-dashoffset="${f(-st.clock * 30)}"/>`; }
+  s += plate(56, 126, 4, '定量充填', 3.2);
+  return s;
+}
+function n2Station(st, o){
+  let s = cyl(14, 102, FH, 108, 7, { l:'#9aa3a6', m:'#7c8588', d:'#4f5759' }, toneI, 1.3, 20);   // nitrogen cylinder
+  s += rod([14, 102, 108], [14, 102, 116], 2, BRASS, toneI, .9) + cylX(14, 18, 99, 113, 3, METAL, toneI, .9, 14) + cylX(14, 18, 105, 113, 3, METAL, toneI, .9, 14);
+  s += tx(21.1, 102, 60, 'N2', 4, '#fbf8ee', 800);
+  return s;
+}
+function guardBack(){ return box(18, 54, 22, 54, 92, 24, STEEL, toneI, 1) + shape([[18, 54, 24], [18, 92, 24], [18, 92, 46], [18, 54, 46]], toneI([1, 0, 0], STEEL), 1) + box(18, 54, 46, 54, 92, 48, STEEL, toneI, 1); }
+function guardFront(st, o){
+  let s = '';
+  for (const y of [56, 90]) s += box(18, y - 1, 24, 54, y + 1, 46, STEEL, toneI, 1);           // end plates
+  s += plate(54, 73, 14, '氮氣加壓', 3.2);
+  if (o.hose){ const nk = add3(o.base, o.ax, TOP + 4); s += `<path d="${pd([[14, 102, 112], [30, 100, 70], nk], false)}" fill="none" stroke="${INK}" stroke-width="2.6"/><path d="${pd([[14, 102, 112], [30, 100, 70], nk], false)}" fill="none" stroke="#2f2c29" stroke-width="1.6"/>`; }
+  return s;
+}
+function tankBack(){
+  let s = '';
+  s += box(72, 58, FH, 122, 112, 5, STEEL, toneI, 1);
+  s += shape([[72, 58, 5], [72, 112, 5], [72, 112, 34], [72, 58, 34]], '#e3f1f6', .8);
+  s += shape([[72, 58, 5], [122, 58, 5], [122, 58, 34], [72, 58, 34]], '#d7eaf1', .8);
+  return s;
+}
+function tankFront(st, o){
+  let s = '';
+  s += fill(pd([[72, 58, 28], [122, 58, 28], [122, 112, 28], [72, 112, 28]]), WATER, 'opacity=".22"');
+  s += fill(pd([[122, 58, 5], [122, 112, 5], [122, 112, 28], [122, 58, 28]]), WATER, 'opacity=".3"') + fill(pd([[72, 112, 5], [122, 112, 5], [122, 112, 28], [72, 112, 28]]), WATER, 'opacity=".3"');
+  s += ink(pd([[72, 58, 34], [122, 58, 34], [122, 112, 34], [72, 112, 34]]), 1.2) + ink(pd([[122, 58, 5], [122, 112, 5], [122, 112, 34], [122, 58, 34]]), 1.2) + ink(pd([[72, 112, 5], [122, 112, 5], [122, 112, 34], [72, 112, 34]]), 1.2);
+  s += fill(pd([[96, 70, 31], [106, 70, 33], [106, 70, 22], [96, 70, 20]]), '#ffffff', 'opacity=".4"');
+  if (o.bubbles > 0) for (let i = 0; i < 4; i++){ const u = (st.clock * 1.3 + i / 4) % 1, [X, Y] = P(98 + i, 70 + i * 2, 18 + u * 10);
+    s += `<circle cx="${f(X)}" cy="${f(Y)}" r="1.2" fill="none" stroke="#ffffff" stroke-width=".8" opacity="${f(o.bubbles * (1 - u))}"/>`; }
+  if (o.leakOk) s += shape(on(PX(122.1), ellUV(66, 14, 3, 3, 14)), '#43c25c', .8);
+  s += plate(122, 98, 10, '浸水氣密', 3.2);
+  return s;
+}
+function finishPad(){ return box(58, 10, FH, 92, 42, 5, { l:'#ffe9a8', m:'#f2d27a', d:'#b8963a' }, toneI, 1) + plate(92, 26, 5.4, '完成歸位', 2.6); }
+
+/* ---------- the seven steps (each runs as a timeline; p = 0..1) ---------- */
+const STEPS = [
+  { name:'清洗補漆',          dur:4,   card:['高壓水槍清洗外觀，去除髒汙泥垢', '掉漆、磨損處局部補漆'] },
+  { name:'洩壓與抽粉',        dur:6,   card:['接上設備排氣洩壓，拆下護蓋與栓塞', '倒置於抽粉口，舊乾粉過篩回收', '電腦監控面板掌握檢修與充填數據'] },
+  { name:'內視鏡檢查／零件清潔', dur:4.5, card:['內視鏡深入瓶身，檢查內壁有無鏽蝕', '刷洗閥門、閥門心與橡膠零件'] },
+  { name:'耐水壓／烘乾',       dur:5.5, card:['耐水壓試驗機 GC-02T2：注水耐壓測試', '鋼瓶烘乾機 GC-02D2：倒置熱風烘乾'] },
+  { name:'定量充填／回裝',     dur:6,   card:['充填檢驗合格的新乾粉，自動秤重', '更換檢修環，裝回閥門、護蓋與栓塞'] },
+  { name:'氮氣加壓／氣密檢查', dur:6,   card:['氮氣加壓，壓力錶指針落在綠色區', '整支浸入水中，確認沒有氣泡漏氣'] },
+  { name:'檢修標示／歸位',     dur:3,   card:['貼上檢修換藥標示，完成歸位'] },
+];
+// everything about the scene follows from (done, cur, p)
+function pose(st){
+  const o = { base:SPOT.wash.base, ax:UP, valve:true, valvePos:null, pressure:.9, dirt:1, chips:1, ring:'old', tag:0, kg:KG, scale:0,
+              scope:false, clean:false, powderOut:false, pour:false, hydroP:0, hydroOk:false, heat:0, hose:false, bubbles:0, leakOk:false, spray:0, brush:0, puff:0, where:'wash' };
+  const k = st.cur >= 0 ? st.cur : st.done, p = st.cur >= 0 ? st.p : 0, after = i => st.done > i;
+  const at = (name) => { o.base = SPOT[name].base; o.ax = SPOT[name].ax; o.where = name; };
+  if (after(0)){ o.dirt = 0; o.chips = 0; }
+  if (after(1)){ o.valve = false; o.pressure = 0; o.kg = 0; }
+  if (after(2)) o.hydroOk = false;
+  if (after(3)){ o.hydroP = 0; }
+  if (after(4)){ o.valve = true; o.ring = 'new'; o.kg = KG; o.scale = KG + 1.2; }
+  if (after(5)){ o.pressure = .9; o.leakOk = true; }
+  if (after(6)){ o.tag = 1; }
+  const step = st.cur;
+  if (step < 0){                                  // resting at the end of the last finished step
+    at(['wash', 'wash', 'extract', 'bench', 'dryer', 'scale', 'tank', 'done'][st.done]);   // where step N leaves the bottle
+    return o; }
+  if (step === 0){ at('wash'); o.spray = p < .55 ? 1 : 0; o.dirt = 1 - seg(p, .1, .5); o.brush = p > .55 ? 1 : 0; o.chips = 1 - seg(p, .6, .95); }
+  if (step === 1){
+    if (p < .14) Object.assign(o, travel(SPOT.wash, SPOT.vent, seg(p, 0, .14)));
+    else if (p < .42){ at('vent'); o.pressure = .9 * (1 - seg(p, .14, .28)); o.puff = p < .3 ? 1 : 0;
+      if (p > .3){ o.valve = false; o.valvePos = travel({ base:add3(SPOT.vent.base, UP, TOP), ax:UP }, { base:TRAY, ax:[0, -1, 0] }, seg(p, .3, .42)); } }
+    else if (p < .64){ o.valve = false; o.pressure = 0; Object.assign(o, travel(SPOT.vent, SPOT.extract, seg(p, .42, .64))); }
+    else { at('extract'); o.valve = false; o.pressure = 0; o.powderOut = p < .97; o.kg = KG * (1 - seg(p, .64, .96)); }
+    if (p > .3) o.pressure = 0;
+  }
+  if (step === 2){
+    if (p < .26) Object.assign(o, travel(SPOT.extract, SPOT.bench, seg(p, 0, .26)));
+    else { at('bench'); o.scope = p > .28 && p < .68; o.clean = p > .68; }
+  }
+  if (step === 3){
+    if (p < .2) Object.assign(o, travel(SPOT.bench, SPOT.hydro, seg(p, 0, .2)));
+    else if (p < .46){ at('hydro'); o.hydroP = seg(p, .22, .4); o.hydroOk = p > .4; }
+    else if (p < .68){ Object.assign(o, travel(SPOT.hydro, SPOT.dryer, seg(p, .46, .68))); }
+    else { at('dryer'); o.heat = 1; }
+  }
+  if (step === 4){
+    if (p < .2){ Object.assign(o, travel(SPOT.dryer, SPOT.scale, seg(p, 0, .2))); o.scale = 0; }
+    else { at('scale'); o.scale = 1.2 + KG * seg(p, .22, .6); o.kg = KG * seg(p, .22, .6); o.pour = p > .22 && p < .6;
+      if (p > .62) o.ring = p > .72 ? 'new' : 'old';
+      if (p > .74){ const t = seg(p, .74, .95); o.valve = t >= 1; if (t < 1) o.valvePos = travel({ base:TRAY, ax:[0, -1, 0] }, { base:add3(SPOT.scale.base, UP, TOP), ax:UP }, t); }
+      else o.valve = false; }
+    if (p >= .2) o.scale = Math.max(o.scale, 1.2);
+  }
+  if (step === 5){
+    if (p < .2) Object.assign(o, travel(SPOT.scale, SPOT.guard, seg(p, 0, .2)));
+    else if (p < .46){ at('guard'); o.hose = true; o.pressure = .9 * seg(p, .22, .42); }
+    else if (p < .66) Object.assign(o, travel(SPOT.guard, SPOT.tank, seg(p, .46, .66)));
+    else { at('tank'); o.bubbles = 1 - seg(p, .68, .82); o.leakOk = p > .84; }
+    o.pressure = p < .22 ? 0 : (p < .46 ? .9 * seg(p, .22, .42) : .9);
+  }
+  if (step === 6){
+    if (p < .4) Object.assign(o, travel(SPOT.tank, SPOT.done, seg(p, 0, .4)));
+    else { at('done'); o.tag = seg(p, .45, .8); }
+  }
+  return o;
+}
+
+/* ---------- scene ---------- */
+let VB0 = null;                                    // the full-view viewBox, read once after mounting
+function camTarget(st, o){
+  if (!VB0) return null;
+  if (st.cur < 0 && (st.done === 0 || st.done >= 7)) return { cx: VB0.x + VB0.width / 2, cy: VB0.y + VB0.height / 2, z: 1 };
+  const [cx, cy] = P(...add3(o.base, UP, 16));
+  return { cx, cy, z: 2 };
+}
+function scene(st, m){
+  const o = pose(st);
+  if (VB0){
+    if (!st.cam) st.cam = camTarget(st, o);
+    const w = VB0.width / st.cam.z, h = VB0.height / st.cam.z;
+    const x = Math.min(VB0.x + VB0.width - w, Math.max(VB0.x - w * .25, st.cam.cx - w * .55)), y = Math.min(VB0.y + VB0.height - h * .8, Math.max(VB0.y - h * .1, st.cam.cy - h * .52));
+    st.view = { x, y, w, h };
+    document.getElementById('fig').setAttribute('viewBox', `${f(x)} ${f(y)} ${f(w)} ${f(h)}`);
+    INK_K = w / INK_REF_VB;                         // keep ink the same weight on screen while zoomed
+  }
+  const bt = boardTop(...BRD, FH, 6);
+  let s = board(...BRD, FH, 6, FLOOR);
+  const ext = extinguisher(o), bAt = add3(o.base, o.ax, TOP / 2);
+  const parts = [
+    { at:[30, 381, 4], svg: washBay() },
+    { at:[30, 326, 40], svg: extractor(st, o) },
+    { at:[30, 266, 30], svg: bench(st, o) },
+    { at:[20, 220, 30], svg: hydroBack() },
+    { at:[52, 220, 20], svg: hydroFront(st, o) },
+    { at:[12, 178, 30], svg: dryerBack() },
+    { at:[52, 178, 10], svg: dryerFront(st, o) },
+    { at:[30, 131, 30], svg: filler(st, o) },
+    { at:[14, 102, 50], svg: n2Station(st, o) },
+    { at:[20, 73, 30], svg: guardBack() },
+    { at:[50, 73, 36], svg: guardFront(st, o) },
+    { at:[72, 85, 10], svg: tankBack() },
+    { at:[124, 85, 20], svg: tankFront(st, o) },
+    { at:[75, 26, 2], svg: finishPad() },
+  ];
+  // the extinguisher sorts in by where it is: inside the hydro tester / dryer / guard / tank it sits between back and front
+  const inside = { hydro:[36, 220, 25], dryer:[40, 178, 15], guard:[36, 73, 33], tank:[98, 85, 15] }[o.where];
+  parts.push({ at: inside || bAt, svg: ext });
+  if (o.valvePos) parts.push({ at: o.valvePos.base, svg: valveDraw(o.valvePos.base, o.valvePos.ax, 0, false) });
+  else if (!o.valve) parts.push({ at: TRAY, svg: valveDraw(TRAY, [0, -1, 0], 0, false) });
+  s += byDepth(parts);
+  // effects on top: wash spray, paint brush, venting puff
+  if (o.spray){ const g0 = [80, 384, 40], g1 = add3(o.base, UP, 16);
+    s += rod(add3(g0, [10, 0, 6], 1), g0, 1.6, { l:'#ffd27a', m:'#f2b631', d:'#a7820f' }, toneI, 1);
+    s += `<path d="${pd([g0, g1], false)}" fill="none" stroke="${WATER}" stroke-width="2.6" stroke-dasharray="3 2" stroke-dashoffset="${f(-st.clock * 40)}"/>`; }
+  if (o.brush){ const b0 = add3(add3(o.base, UP, 17 + 3 * Math.sin(st.clock * 9)), [1, 1, 0], 7); s += rod(b0, add3(b0, [1, .3, .6], 12), 1, WOOD, toneI, .9) + rod(b0, add3(b0, [-1, -.3, -.6], 2.5), 1.6, RED, toneI, .8); }
+  if (o.puff){ const n = add3(o.base, UP, TOP + 6); for (let i = 0; i < 4; i++){ const u = (st.clock * 1.8 + i / 4) % 1, [X, Y] = P(...add3(n, [3 * u, 2 * Math.sin(i), 8 * u]));
+    s += `<circle cx="${f(X)}" cy="${f(Y)}" r="${f(1.5 + 3 * u)}" fill="#d6e6ef" opacity="${f(.8 * (1 - u))}"/>`; } }
+  s += specCard(st) + closeup(st);
+  return s;
+}
+/* ---------- close-up panel: a flat cut-away drawing of what the current step is actually doing ---------- */
+function closeup(st){
+  const k = st.cur >= 0 ? st.cur : st.done - 1; if (k < 0) return '';
+  const p = st.cur >= 0 ? st.p : 1, o = pose(st);
+  const px = INK_K * INK_REF_VB / 988, vx = st.view ? st.view.x : 0, vy = st.view ? st.view.y : 0, vw = st.view ? st.view.w : INK_K * INK_REF_VB;
+  const W = 272, H = 250, ox = vx + vw - (W + 6) * px, oy = vy + 178 * px;   // below the numbers at top right
+  const X = x => f(ox + x * px), Y = y => f(oy + y * px), N = v => f(v * px);
+  const M = pts => 'M' + pts.map(([x, y]) => X(x) + ' ' + Y(y)).join('L');
+  const R = (x, y, w, h, fillc, r = 0, sw = 1.2, extra = '') => `<rect x="${X(x)}" y="${Y(y)}" width="${N(w)}" height="${N(h)}" rx="${N(r)}" fill="${fillc}" stroke="${INK}" stroke-width="${sw}" ${extra}/>`;
+  const Cc = (x, y, r, fillc, sw = 1, extra = '') => `<circle cx="${X(x)}" cy="${Y(y)}" r="${N(r)}" fill="${fillc}" stroke="${sw ? INK : 'none'}" stroke-width="${sw}" ${extra}/>`;
+  const Tt = (x, y, str, size, col = INK, w = 800, an = 'middle') => `<text x="${X(x)}" y="${Y(y)}" font-size="${N(size)}" fill="${col}" text-anchor="${an}" font-family="ui-monospace,Menlo,monospace" font-weight="${w}">${str}</text>`;
+  const Ln = (pts, col = INK, sw = 1.2, extra = '') => `<path d="${M(pts)}" fill="none" stroke="${col}" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" ${extra}/>`;
+  const RED2 = '#e2483d', GREEN = '#2f9e4f', BLUE = '#3d9be0', POW = '#f1ead9', t = st.clock;
+  // a bottle seen from the side; cut = show the inside; fill = {col, level}; flip = upside down
+  function bottle(cx, by, h, o2 = {}){
+    const w = h * .38, top = by - h, sh = top + h * .12, flip = o2.flip;
+    const T2 = y => flip ? (by + top) - y : y;
+    const body = [[cx - w / 2, T2(by)], [cx + w / 2, T2(by)], [cx + w / 2, T2(sh)], [cx + w * .18, T2(top + 4)], [cx - w * .18, T2(top + 4)], [cx - w / 2, T2(sh)]];
+    let s = `<path d="${M(body)}Z" fill="${o2.cut ? '#fbe3dc' : '#d23a2f'}" stroke="${INK}" stroke-width="1.6"/>`;
+    if (o2.cut){
+      s += `<path d="${M(body)}Z" fill="none" stroke="#d23a2f" stroke-width="5" opacity=".9"/>`;
+      if (o2.fill && o2.fill.level > 0){ const lv = o2.fill.level, y0 = by - 2, y1 = by - 2 - (h - 8) * lv;
+        s += `<clipPath id="cpb${k}"><path d="${M(body)}Z"/></clipPath><rect clip-path="url(#cpb${k})" x="${X(cx - w / 2 + 2)}" y="${Y(Math.min(y0, y1))}" width="${N(w - 4)}" height="${N(Math.abs(y1 - y0))}" fill="${o2.fill.col}"/>`; }
+    }
+    const nk0 = T2(top + 4), nk1 = T2(top - 2);
+    s += R(cx - 4, Math.min(nk0, nk1), 8, 6, '#cfa94a', 1, 1);
+    if (o2.ring) s += R(cx - 6.5, flip ? nk0 + .5 : nk0 - 1.5, 13, 2.6, o2.ring, 1, .9);
+    if (o2.valve){ const vy0 = flip ? nk1 : nk1 - 12; s += R(cx - 6, vy0, 12, 12, '#3d3935', 2, 1.1) + Cc(cx + 10, vy0 + 5, 5, '#fbf8ee', 1); }
+    return s; }
+  function gauge(cx, cy, r, val, label){
+    let s = Cc(cx, cy, r + 3, '#c6ccce', 1.4) + Cc(cx, cy, r, '#fbf8ee', 1);
+    const arc = (a0, a1, col) => { const pts = []; for (let i = 0; i <= 12; i++){ const a = (a0 + (a1 - a0) * i / 12) * Math.PI / 180; pts.push([cx + (r - 4) * Math.cos(a), cy - (r - 4) * Math.sin(a)]); } return Ln(pts, col, 4, 'stroke-linecap="butt"'); };
+    s += arc(160, 120, RED2) + arc(110, 60, GREEN) + arc(50, 20, RED2);
+    const a = (160 - 140 * val) * Math.PI / 180;
+    s += Ln([[cx, cy], [cx + (r - 7) * Math.cos(a), cy - (r - 7) * Math.sin(a)]], INK, 2.2) + Cc(cx, cy, 2.6, INK, 0);
+    if (label) s += Tt(cx, cy + r * .55, label, 9, '#6a6658', 700);
+    return s; }
+  const ok = (x, y, str) => R(x - str.length * 5.6 - 8, y - 12, str.length * 11.2 + 16, 20, '#e3f4e8', 10, 1.1) + Tt(x, y + 3, str, 11, GREEN);
+  const ng = (x, y, str) => R(x - str.length * 5.6 - 8, y - 12, str.length * 11.2 + 16, 20, '#fde3e1', 10, 1.1) + Tt(x, y + 3, str, 11, RED2);
+  let title = '', body = '';
+  if (k === 0){
+    title = '外觀清洗與補漆';
+    body += bottle(136, 222, 170, { valve:true });
+    const dirt = 1 - seg(p, .1, .5), chip = 1 - seg(p, .6, .95);
+    for (const [x, y, r] of [[124, 190, 7], [146, 160, 5], [130, 130, 6], [150, 110, 4]]) body += Cc(x, y, r, '#7a5a3a', 0, `opacity="${f(.9 * dirt)}"`);
+    body += Cc(144, 182, 6, chip > .02 ? '#9aa3a6' : '#d23a2f', 0);
+    if (p < .55){ for (let i = 0; i < 4; i++){ const u = (t * 2 + i / 4) % 1; body += Ln([[40 + 66 * u, 126 + i * 18], [56 + 66 * u, 128 + i * 18]], BLUE, 2.4); }
+      body += R(10, 118, 32, 14, '#f2b631', 3, 1.1) + Tt(136, 244, '高壓水槍沖掉泥垢', 11); }
+    else body += Ln([[200, 150], [160, 180]], '#8e6236', 4) + R(152, 176, 10, 8, '#d23a2f', 2, 1) + Tt(136, 244, '掉漆、磨損處局部補漆', 11);
+  }
+  if (k === 1){
+    if (p < .3){ title = '排氣洩壓';
+      body += gauge(136, 126, 62, .9 * (1 - seg(p, .14, .28)), '壓力錶');
+      for (let i = 0; i < 4; i++){ const u = (t * 1.8 + i / 4) % 1; body += Cc(210 + 20 * u, 70 - 30 * u, 6 + 8 * u, '#d6e6ef', 0, `opacity="${f(.9 * (1 - u))}"`); }
+      body += p > .27 ? ok(136, 222, '壓力歸零，可安全拆卸') : Tt(136, 226, '排出瓶內壓力', 12);
+    } else if (p < .42){ title = '拆下閥門、護蓋與栓塞';
+      const lift = 40 * seg(p, .3, .42);
+      body += bottle(136, 236, 150, {});
+      body += R(126, 74 - lift, 20, 18, '#3d3935', 3, 1.1) + Cc(160, 82 - lift, 7, '#fbf8ee', 1);
+      body += Ln([[104, 84 - lift], [104, 64 - lift]], INK, 1.4) + `<path d="M${X(98)} ${Y(68 - lift)}L${X(104)} ${Y(60 - lift)}L${X(110)} ${Y(68 - lift)}" fill="none" stroke="${INK}" stroke-width="1.4"/>`;
+      body += Tt(206, 130, '轉開取下', 11, '#6a6658', 700);
+    } else { title = '倒置抽粉・過篩回收';
+      const lv = o.kg / KG;
+      body += bottle(110, 172, 128, { flip:true, cut:true, fill:{ col:POW, level:lv } });
+      body += `<path d="${M([[72, 184], [148, 184]])}" stroke="#8a96a3" stroke-width="3" stroke-dasharray="2 2" fill="none"/>` + Ln([[70, 184], [150, 184]], INK, 1);
+      body += Tt(170, 188, '篩網', 10, '#6a6658', 700, 'start');
+      body += `<path d="${M([[66, 192], [154, 192], [126, 238], [94, 238]])}Z" fill="#e6eaeb" stroke="${INK}" stroke-width="1.3"/>`;
+      if (p > .64 && p < .97) for (let i = 0; i < 8; i++){ const u = (t * 1.6 + i / 8) % 1; body += Cc(104 + (i % 4) * 4, 176 + 50 * u, 2, POW, .5); }
+      body += R(186, 60, 74, 44, '#1d2a26', 4, 1.1) + Tt(223, 77, '乾粉', 9, '#8af0ae', 700) + Tt(223, 96, o.kg.toFixed(2) + 'kg', 12, '#8af0ae', 800);
+      body += Tt(223, 120, '電腦監控', 9, '#6a6658', 700);
+    }
+  }
+  if (k === 2){
+    if (p < .68){ title = '內視鏡檢查瓶身內壁';
+      body += bottle(70, 232, 172, { cut:true });
+      const s0 = seg(p, .28, .6), camY = 70 + 100 * s0;
+      body += Ln([[70, 34], [70, camY]], '#2f2c29', 2.4);
+      body += R(66, camY, 8, 8, '#3d3935', 2, 1);
+      body += `<path d="${M([[70, camY + 8], [48, camY + 40], [92, camY + 40]])}Z" fill="#fff6c8" opacity=".75"/>`;
+      body += Ln([[70, 34], [120, 30], [150, 50]], '#2f2c29', 2);
+      body += R(148, 46, 112, 94, '#2f2c29', 10, 1.4) + R(156, 54, 96, 70, '#20343d', 4, 1);
+      for (let i = 4; i >= 1; i--) body += Cc(204, 89, 6 * i + 6 * ((t * .8) % 1), 'none', 0, `stroke="#9ec7d6" stroke-width="1" opacity="${f(.25 + .15 * i)}"`);
+      body += Cc(204, 89, 6, '#0f1a1f', 0);
+      body += Tt(204, 152, '手持螢幕看內壁', 9, '#6a6658', 700);
+      body += p > .55 ? ok(204, 180, '內壁無鏽蝕') : Tt(204, 184, '檢查中…', 11, '#6a6658', 700);
+      body += ng(204, 214, '有鏽蝕 不再使用');
+    } else { title = '清潔閥門與零件';
+      body += R(30, 150, 214, 60, '#336fb3', 8, 1.2);
+      body += R(48, 104, 26, 40, '#3d3935', 4, 1.1) + Tt(61, 96, '閥門', 10);
+      body += R(104, 112, 10, 32, '#c6ccce', 2, 1) + Tt(109, 104, '閥門心', 10);
+      body += Cc(160, 128, 13, 'none', 0, 'stroke="#2f2c29" stroke-width="4"') + Tt(160, 104, 'O 型環', 10);
+      body += `<path d="${M([[196, 114], [214, 119], [196, 124], [214, 129], [196, 134], [214, 139]])}" fill="none" stroke="#8a96a3" stroke-width="2"/>` + Tt(205, 104, '彈簧', 10);
+      const bx = 60 + 130 * (.5 + .5 * Math.sin(t * 4));
+      body += R(bx, 60, 34, 10, '#bf8a4f', 3, 1);
+      for (const d of [4, 12, 20, 28]) body += Ln([[bx + d, 70], [bx + d, 80]], '#8a6a3a', 2);
+      body += Tt(136, 236, '刷洗乾淨，橡膠件老化就更換', 11);
+    }
+  }
+  if (k === 3){
+    if (p < .46){ title = '耐水壓試驗 GC-02T2';
+      const fillv = seg(p, .2, .3), press = seg(p, .26, .4);
+      body += R(26, 44, 130, 196, '#e6eaeb', 8, 1.3);
+      body += bottle(91, 230, 168, { cut:true, fill:{ col:'#7cc0ef', level:fillv } });
+      body += gauge(214, 98, 40, press, '試驗壓力');
+      body += Ln([[91, 56], [91, 36], [180, 36], [180, 60]], BLUE, 3);
+      body += p > .4 ? ok(214, 176, '無變形 無滲漏') : Tt(214, 178, fillv < 1 ? '注水中…' : '加壓中…', 11, '#6a6658', 700);
+      body += Tt(214, 210, '確認鋼瓶結構安全', 10, '#6a6658', 700);
+    } else { title = '倒置熱風烘乾 GC-02D2';
+      body += R(26, 156, 220, 86, '#e6eaeb', 8, 1.3);
+      body += bottle(136, 194, 150, { flip:true, cut:true });
+      body += R(130, 198, 12, 44, '#c6ccce', 2, 1);
+      for (let i = 0; i < 3; i++){ const u = (t * .9 + i / 3) % 1, x = 120 + i * 16, y = 190 - 120 * u;
+        body += `<path d="${M([[x, y + 14], [x + 4, y + 7], [x, y], [x + 4, y - 7]])}" fill="none" stroke="#f08a3c" stroke-width="2" opacity="${f(1 - u)}"/>`; }
+      if (p < .8) for (let i = 0; i < 3; i++) body += Cc(118 + i * 18, 110 + (i % 2) * 20, 3, '#7cc0ef', 0, `opacity="${f(1 - seg(p, .68, .8))}"`);
+      body += Tt(214, 126, '熱風', 11, '#f08a3c');
+      body += p > .85 ? ok(136, 222, '瓶內乾燥 不留水氣') : Tt(136, 224, '烘乾中…', 11, '#6a6658', 700);
+    }
+  }
+  if (k === 4){
+    title = '定量充填與回裝';
+    const lv = o.kg / KG;
+    body += bottle(96, 222, 150, { cut:true, fill:{ col:POW, level:lv }, ring: p > .72 ? '#f2c230' : null, valve: o.valve });
+    if (o.pour) body += `<path d="${M([[66, 30], [126, 30], [100, 56], [92, 56]])}Z" fill="#e6eaeb" stroke="${INK}" stroke-width="1.2"/>` + Ln([[96, 56], [96, 78]], '#d8cfb6', 4, 'stroke-dasharray="3 2"');
+    body += R(40, 224, 112, 12, '#c6ccce', 3, 1.1);
+    body += R(170, 56, 90, 52, '#1d2a26', 5, 1.2) + Tt(215, 76, '自動秤重', 9, '#8af0ae', 700) + Tt(215, 98, o.kg.toFixed(2) + ' kg', 14, '#8af0ae', 800);
+    body += Tt(215, 124, `目標 ${KG.toFixed(2)} kg`, 10, '#6a6658', 700);
+    if (p > .6 && p < .74) body += R(160, 156, 100, 20, '#fff4d6', 10, 1) + Tt(210, 170, '換新檢修環', 10);
+    if (p > .74) body += R(160, 156, 100, 20, '#fff4d6', 10, 1) + Tt(210, 170, '裝回閥門', 10);
+    if (lv >= .999 && p < .62) body += ok(215, 204, '重量精準');
+  }
+  if (k === 5){
+    if (p < .46){ title = '氮氣加壓';
+      body += gauge(136, 118, 66, .9 * seg(p, .22, .42), '壓力錶');
+      body += p > .42 ? ok(136, 222, '指針在綠色區') : Tt(136, 224, '充入氮氣…', 12, '#6a6658', 700);
+    } else { title = '浸水氣密檢查';
+      body += R(20, 96, 232, 120, '#d3ebf8', 6, 1.3) + `<rect x="${X(20)}" y="${Y(96)}" width="${N(232)}" height="${N(16)}" fill="#ffffff" opacity=".6"/>`;
+      body += `<g transform="rotate(-90 ${X(136)} ${Y(158)})">${bottle(136, 218, 120, { valve:true, ring:'#f2c230' })}</g>`;
+      body += Tt(136, 82, '整支浸水，觀察閥門接合處', 11, '#6a6658', 700);
+      body += p > .84 ? ok(136, 236, '沒有氣泡＝不漏氣') : Tt(136, 238, '觀察中…', 11, '#6a6658', 700);
+    }
+  }
+  if (k === 6){
+    title = '檢修換藥標示';
+    body += bottle(66, 236, 150, { valve:true, ring:'#f2c230' });
+    const tg = seg(p, .45, .8);
+    body += `<g opacity="${f(Math.max(.25, tg))}">` + R(116, 54, 146, 156, '#ffe066', 8, 1.4) + Cc(130, 68, 5, '#ffffff', 1);
+    const rows = ['檢修換藥標示', '檢修日期', '藥劑 ABC 乾粉', '藥劑重量 3.5 kg', '下次檢修'];
+    rows.forEach((r2, i) => { body += Tt(128, 98 + i * 23, r2, i ? 10.5 : 12, INK, 800, 'start'); if (i) body += Ln([[128, 104 + i * 23], [254, 104 + i * 23]], '#b8963a', .8); });
+    body += `</g>` + Ln([[74, 74], [120, 68]], INK, 1);
+  }
+  let s = `<rect x="${X(0)}" y="${Y(0)}" width="${N(W)}" height="${N(H)}" rx="${N(12)}" fill="#ffffff" stroke="${INK}" stroke-width="1.8"/>`;
+  s += `<clipPath id="cpp"><rect x="${X(2)}" y="${Y(16)}" width="${N(W - 4)}" height="${N(H - 18)}" rx="${N(10)}"/></clipPath>`;
+  s += `<g clip-path="url(#cpp)">${body}</g>`;
+  s += `<rect x="${X(10)}" y="${Y(-11)}" width="${N(W - 20)}" height="${N(24)}" rx="${N(12)}" fill="#ef6a4c" stroke="${INK}" stroke-width="1.2"/>` + Tt(W / 2, 6, '放大看　' + title, 12.5);
+  return s;
+}
+
+function specCard(st){
+  const k = st.cur >= 0 ? st.cur : st.done - 1; if (k < 0) return '';
+  const px = INK_K * INK_REF_VB / 988, S = STEPS[k], lines = S.card;
+  const T2 = (x, y, str, size, c = INK, w = 800, an = 'start') => `<text x="${f(x)}" y="${f(y)}" font-size="${f(size * px)}" fill="${c}" text-anchor="${an}" font-family="ui-monospace,Menlo,monospace" font-weight="${w}">${str}</text>`;
+  const vx = st.view ? st.view.x : 0, vy = st.view ? st.view.y : 0;
+  const x0 = vx + 6 * px, w = 268 * px, h = (44 + lines.length * 20) * px, y0 = vy + 676 * px - h;
+  let s = `<rect x="${f(x0)}" y="${f(y0)}" width="${f(w)}" height="${f(h)}" rx="${f(10 * px)}" fill="#fbf8ee" stroke="${INK}" stroke-width="1.8"/>`;
+  s += `<rect x="${f(x0 + 10 * px)}" y="${f(y0 + 10 * px)}" width="${f(w - 20 * px)}" height="${f(22 * px)}" rx="${f(11 * px)}" fill="#ef6a4c" stroke="${INK}" stroke-width="1.2"/>`;
+  s += T2(x0 + w / 2, y0 + 26 * px, `${k + 1}／7　${S.name}`, 12.5, INK, 800, 'middle');
+  lines.forEach((str, i) => { s += T2(x0 + 14 * px, y0 + (54 + i * 20) * px, str, 11.5, '#3d3935', 800); });
+  return s;
+}
+
+/* ---------- behaviour ---------- */
+let ui;
+function step(dt){
+  const st = ui.st; st.clock += dt;
+  if (st.cur < 0 && st.done < st.target){ st.cur = st.done; st.p = 0; ui.flash(`${st.cur + 1}　${STEPS[st.cur].name}`, 2000); }
+  if (st.cur >= 0){ st.p += dt / STEPS[st.cur].dur; if (st.p >= 1){ st.done = st.cur + 1; st.cur = -1; } }
+  const tg = camTarget(st, pose(st));
+  if (tg && st.cam){ const k = Math.min(1, dt * 2.6); st.cam.cx += (tg.cx - st.cam.cx) * k; st.cam.cy += (tg.cy - st.cam.cy) * k; st.cam.z += (tg.z - st.cam.z) * k; }
+  return true;
+}
+const go = n => (st, ui) => {
+  if (st.done >= n) return ui.flash('這一步已經完成，按重置可重新開始');
+  if (st.target >= n) return;
+  if (st.done < n - 1) ui.flash(`依序進行：先完成第 ${st.done + 1} 步`, 2000);
+  st.target = n;
+};
+ui = mountFigure({
+  fig:'05', title:'滅火器性能檢修', hint:'乾粉抽取與充填・內視鏡檢查・氮氣加壓・耐水壓與烘乾',
+  size:[BRD[2], BRD[3], 132], palette:'tomato',
+  state:{ done:0, cur:-1, p:0, target:0, clock:0 },
+  scene,
+  stats: st => { const o = pose(st); return [{ label:'步驟', value: (st.cur >= 0 ? st.cur + 1 : st.done) + '／7', small:true },
+    { label:'乾粉', value: o.kg.toFixed(1) + ' kg', small:true }, { label:'壓力', value: o.pressure > .6 ? '綠色區' : o.pressure > 0 ? (st.cur === 1 ? '洩壓中' : '加壓中') : '已洩壓', small:true }]; },
+  buttons: STEPS.map((S, i) => ({ label:`${i + 1} ${S.name}`, onClick: go(i + 1) })).concat([{ label:'重置', onClick:(st, ui) => { Object.assign(st, { done:0, cur:-1, p:0, target:0 }); ui.flash('換下一支待檢修的滅火器'); } }]),
+  buttonsLabel:'檢修作業流程',
+  credit:false,
+  params:(st, q) => { st.pal = 'tomato'; if (q.has('done')) st.done = st.target = +q.get('done');
+    if (q.has('cur')){ st.cur = +q.get('cur'); st.p = +(q.get('p') || .5); st.done = st.cur; st.target = st.cur + 1; } },
+});
+{ const css = document.createElement('style');
+  css.textContent = 'header,.stage,#fig,.controls,.made-with{max-width:988px} header h1{font-size:28px;font-weight:800;letter-spacing:.04em} :root{--paper:#ffffff} body{background:#ffffff;background-image:none} #fig{overflow:hidden} .stats{background:rgba(255,255,255,.88);padding:4px 10px;border-radius:10px}';
+  document.head.appendChild(css); }
+document.querySelector('header h1').textContent = '滅火器性能檢修與藥劑充填';
+{ const b = document.getElementById('fig').viewBox.baseVal; VB0 = { x:b.x, y:b.y, width:b.width, height:b.height }; ui.render(); }
+document.getElementById('wob').setAttribute('scale', '0');
+document.querySelector('.controls').style.display = 'none';
+window.__pose = pose;
+ui.animate(step);
+</script></body></html>
